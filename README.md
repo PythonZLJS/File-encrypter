@@ -16,6 +16,7 @@ The instructions to set up, run, compile, and install python are lower down on t
 I am working on a python script to automatically set up/downloaded the python libraries needed. But I have not coded that yet but it will come evetialy.
 Also when using the app is self explanatory but if you need help there is a instructions section for use (also lower down)
 Have fun also you don't need to know what encription method you used to encripted a file when decripting.
+Also i am ataching the code downldoe and the pre compiled code as well as a some other veriations of the code. (You should check it out)
 
 ## Features
 
