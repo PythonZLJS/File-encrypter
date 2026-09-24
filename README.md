@@ -9,6 +9,13 @@ zero telemetry — everything stays on your machine.
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
+## Base info
+I made this to encrypt my own files locally with no sending teleatry data to me :)
+You will probably need internet when instilling/setting it up for the first time if you are installing the python packages. But that's just python not me.
+The instructions to set up, run, compile, and install python are lower down on the page.
+I am working on a python script to automatically set up/downloaded the python libraries needed. But I have not coded that yet but it will come evetialy.
+Also when using the app is self explanatory but if you need help there is a instructions section for use (also lower down)
+Have fun also you don't need to know what encription method you used to encripted a file when decripting.
 
 ## Features
 
@@ -86,8 +93,11 @@ at the bottom of this file if you don't have it yet.
 git clone https://github.com/yourusername/cryptvault.git
 cd cryptvault
 ```
+you can also just download it with the download buton.
 
 ### 3. Install the dependencies
+before hand open terminal in that folder that you download (that contains the code) or navigate to the location in terminal.
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -110,9 +120,15 @@ python main.py
 You don't need to run it from source every time — you can compile it
 into a single file that runs with **no Python installed** on the machine
 that uses it. (Building still needs Python + the dependencies installed
-*once*, on the machine doing the build.)
+*once*, on the machine doing the build.) Also for some reason it wont
+run on a VM like the compiled version.
+
+Just to clarify you can only compile it for windows if the OS you use when compiling it is windows and same for all Operating systems.
 
 ### Windows
+
+Find the file in the folder with the python code.
+
 ```bash
 build_windows.bat
 ```
