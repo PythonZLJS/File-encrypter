@@ -112,6 +112,7 @@ This installs:
 ```bash
 python main.py
 ```
+Or just double click the file.
 
 ---
 
