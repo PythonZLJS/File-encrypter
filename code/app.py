@@ -1,482 +1,97 @@
-"""
-CryptVault - Fast, secure, streaming file/folder encryption with a
-liquid-glass GUI and a choice of authenticated encryption algorithms.
-Cross-platform: Windows / macOS / Linux (compile separately on each OS -
-see README.md, or use build_windows.bat / build_unix.sh).
+"""Liquid-glass GUI and background tasks. Launch with python cryptvault.py."""
 
-Run:   python main.py
-Build: pyinstaller --onefile --windowed --name CryptVault main.py
-"""
-
-import sys
+import html
 import os
-import struct
 import secrets
-import string
-import re
-import time
-import zipfile
+import subprocess
+import sys
 import tempfile
 import threading
-import subprocess
-import hashlib
-from pathlib import Path
+import time
 from datetime import datetime
+from pathlib import Path
 
-from cryptography.hazmat.primitives.ciphers.aead import (
-    AESGCM, ChaCha20Poly1305, AESGCMSIV, AESOCB3, AESCCM
-)
-from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-
-from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QFileDialog, QProgressBar, QCheckBox, QFrame, QMessageBox,
-    QGraphicsDropShadowEffect, QListWidget, QListWidgetItem, QTextEdit,
-    QAbstractItemView, QComboBox, QScrollArea, QSizePolicy, QLayout, QMenu,
-    QTabWidget, QDialog, QTableWidget, QTableWidgetItem, QHeaderView
-)
 from PySide6.QtCore import (
-    Qt, QObject, Signal, QRunnable, QThreadPool, QSettings, QRect, QPoint, QSize, QTimer
+    QObject,
+    QPoint,
+    QRect,
+    QRunnable,
+    QSettings,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+    Slot,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QPainter, QLinearGradient, QRadialGradient, QBrush,
-    QDragEnterEvent, QDropEvent, QAction
+    QAction,
+    QBrush,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QFontDatabase,
+    QLinearGradient,
+    QPainter,
+    QPalette,
+    QRadialGradient,
+)
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLayout,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 # ========================================================================
 # CRYPTO ENGINE  (streaming - constant memory use regardless of file size)
 # ========================================================================
-# On-disk format (version 3):
-#   MAGIC(4)="CVL3" | VERSION(1) | LAYERS(1) | IS_FOLDER(1) | KDF_PRESET(8, padded)
-#   for each layer: CIPHER_ID(1) | SALT(16) | NONCE_PREFIX(4)
-#   then a sequence of chunks until EOF:
-#       LEN(4, big-endian) | CIPHERTEXT (includes AEAD authentication tag)
-#
-# Because each layer's CIPHER_ID is stored right in the file, decrypting
-# NEVER requires knowing which "Encryption Type" was used to encrypt -
-# the app reads it straight out of the header and picks the right
-# algorithm(s) automatically, every time.
-#
-# Each chunk is authenticated with associated data binding its index and
-# whether it's the final chunk, so chunks can't be reordered, dropped, or
-# the file truncated without decryption failing. Nonces are never reused:
-# built from a random 4-byte prefix (per layer, per file) + an 8-byte
-# big-endian counter. Key derivation uses scrypt (memory-hard).
-
-MAGIC = b"CVL3"
-VERSION = 3
-KEY_LEN = 32
-CHUNK_SIZE = 1024 * 1024  # 1 MB chunks - keeps memory flat & progress smooth
-SHRED_PASSES = 3
-
-SCRYPT_PRESETS = {
-    "fast":     dict(n=2 ** 14, r=8, p=1),
-    "balanced": dict(n=2 ** 15, r=8, p=1),
-    "paranoid": dict(n=2 ** 17, r=8, p=1),
-}
-
-# ---- Individual cipher algorithms available to build an Encryption Type from ----
-CIPHER_REGISTRY = {
-    0: AESGCM,
-    1: ChaCha20Poly1305,
-    2: AESGCMSIV,
-    3: AESOCB3,
-    4: AESCCM,
-}
-CIPHER_NAMES = {
-    0: "AES-256-GCM",
-    1: "ChaCha20-Poly1305",
-    2: "AES-256-GCM-SIV",
-    3: "AES-256-OCB3",
-    4: "AES-256-CCM",
-}
-
-# ---- Named "Encryption Type" presets offered in the GUI ----
-# Each is an ordered list of cipher IDs (innermost layer first). All of
-# these are strong, modern, authenticated ciphers - none is "weak"; the
-# differences are about speed, hardware support, and defense-in-depth.
-ENCRYPTION_TYPES = [
-    {
-        "name": "AES-256-GCM (Standard)",
-        "ciphers": [0],
-        "summary": "The industry-standard choice - what TLS and most disk encryption uses.",
-        "pros": "Extremely fast on virtually all modern CPUs thanks to hardware AES "
-                "acceleration (AES-NI). The most widely used, audited, and battle-tested "
-                "authenticated cipher in the world today.",
-        "cons": "None significant for personal use. In general, GCM's security depends on "
-                "nonces never repeating - this app already guarantees that automatically, "
-                "so this isn't something you need to worry about.",
-    },
-    {
-        "name": "ChaCha20-Poly1305 (Software-Friendly)",
-        "ciphers": [1],
-        "summary": "A modern cipher designed to run fast even without special CPU hardware.",
-        "pros": "Consistently fast on CPUs that lack AES hardware acceleration (some older "
-                "PCs, budget devices, certain ARM chips). Its software implementation runs "
-                "in constant time by design, which gives strong resistance to timing-based "
-                "side-channel attacks.",
-        "cons": "On a modern desktop/laptop with AES-NI, it's usually a little slower than "
-                "plain AES-256-GCM.",
-    },
-    {
-        "name": "AES-256-GCM-SIV (Misuse-Resistant)",
-        "ciphers": [2],
-        "summary": "AES-GCM's more forgiving sibling - safer if a nonce were ever reused.",
-        "pros": "Provides the same strong security as AES-GCM, but is specifically designed "
-                "to stay safe even in the unlikely event a nonce gets reused - a property "
-                "called 'nonce-misuse resistance'. Good extra peace of mind.",
-        "cons": "Slightly slower than plain AES-GCM, and less commonly deployed in the wild, "
-                "so it has had less real-world scrutiny than GCM (though it's well-studied "
-                "academically).",
-    },
-    {
-        "name": "AES-256-OCB3 (High Performance)",
-        "ciphers": [3],
-        "summary": "One of the fastest authenticated ciphers available, fully parallelizable.",
-        "pros": "Very high throughput with minimal computational overhead - often the "
-                "fastest option on capable hardware. Good choice when raw speed on huge "
-                "files/folders matters most.",
-        "cons": "Was patent-encumbered for many years (patents expired in 2021), so it's "
-                "less universally adopted than GCM and isn't FIPS-approved, meaning it "
-                "shows up less often in compliance-driven software.",
-    },
-    {
-        "name": "AES-256-CCM (Compact / IoT Standard)",
-        "ciphers": [4],
-        "summary": "A well-established cipher used in Bluetooth, Zigbee, and WPA2.",
-        "pros": "Extremely widely deployed in constrained and embedded devices, meaning it's "
-                "been scrutinized heavily in practice over many years.",
-        "cons": "Structurally slower than GCM/OCB3 because it processes data in two internal "
-                "passes rather than one. For huge files this app's chunking keeps that cost "
-                "manageable, but it's still the slowest single-layer option here.",
-    },
-    {
-        "name": "Double Shield (AES-GCM + ChaCha20)",
-        "ciphers": [0, 1],
-        "summary": "Two independent cipher families, layered - defense in depth.",
-        "pros": "Your data stays protected even in the (extremely unlikely) event that a "
-                "serious flaw were ever found in one of the two algorithms alone, since "
-                "they come from entirely different cryptographic designs.",
-        "cons": "Roughly double the CPU time and battery/power cost of a single-layer "
-                "option, since every byte is encrypted twice.",
-    },
-    {
-        "name": "Fort Knox (Triple Layer: AES-GCM + ChaCha20 + AES-GCM-SIV)",
-        "ciphers": [0, 1, 2],
-        "summary": "Maximum layered paranoia - three independent algorithms in sequence.",
-        "pros": "The strongest defense-in-depth option offered here. Would require a "
-                "practical break in all three independent algorithms to fail.",
-        "cons": "Meaningfully slower - roughly triple the processing time and output "
-                "read/write cost. Overkill for almost all personal use cases; mainly useful "
-                "if you specifically want maximum peace of mind and don't mind the wait.",
-    },
-]
-
-
-class CryptoError(Exception):
-    pass
-
-
-class Cancelled(Exception):
-    pass
-
-
-def derive_key(secret: bytes, salt: bytes, preset: str) -> bytes:
-    params = SCRYPT_PRESETS[preset]
-    kdf = Scrypt(salt=salt, length=KEY_LEN, n=params["n"], r=params["r"], p=params["p"])
-    return kdf.derive(secret)
-
-
-def build_secret(password: str, keyfile_bytes: bytes = None) -> bytes:
-    """Combine a password with an optional keyfile into the raw key-derivation
-    input. Using a keyfile means BOTH the password and the exact keyfile are
-    required to decrypt - a "something you know + something you have" scheme.
-    Only the keyfile's hash is mixed in, never the raw bytes, so a very large
-    keyfile doesn't get embedded anywhere."""
-    secret = password.encode("utf-8")
-    if keyfile_bytes:
-        secret += b"|keyfile|" + hashlib.sha256(keyfile_bytes).digest()
-    return secret
-
-
-def sha256_of_file(path: Path, progress_cb=None) -> str:
-    """Streams the file to compute its SHA-256 - lets you independently
-    verify two files are byte-identical (e.g. before/after transfer)."""
-    total = max(path.stat().st_size, 1)
-    h = hashlib.sha256()
-    read = 0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            h.update(chunk)
-            read += len(chunk)
-            if progress_cb:
-                progress_cb(min(99, int(read / total * 100)))
-    if progress_cb:
-        progress_cb(100)
-    return h.hexdigest()
-
-
-def _cipher_by_id(cipher_id: int, key: bytes):
-    return CIPHER_REGISTRY[cipher_id](key)
-
-
-def _nonce_for_chunk(prefix4: bytes, index: int) -> bytes:
-    return prefix4 + struct.pack(">Q", index)
-
-
-def encrypt_stream(src_path: Path, dst_path: Path, secret: bytes, cipher_ids: list,
-                    is_folder: bool, preset: str, progress_cb=None, cancel_check=None):
-    total_size = max(src_path.stat().st_size, 1)
-    layers = len(cipher_ids)
-    salts = [secrets.token_bytes(16) for _ in range(layers)]
-    prefixes = [secrets.token_bytes(4) for _ in range(layers)]
-    keys = [derive_key(secret + f"|layer{i}".encode(), salts[i], preset) for i in range(layers)]
-    ciphers = [_cipher_by_id(cipher_ids[i], keys[i]) for i in range(layers)]
-
-    try:
-        with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
-            fout.write(MAGIC)
-            fout.write(bytes([VERSION]))
-            fout.write(bytes([layers]))
-            fout.write(bytes([1 if is_folder else 0]))
-            fout.write(preset.encode("ascii").ljust(8, b"\x00"))
-            for i in range(layers):
-                fout.write(bytes([cipher_ids[i]]))
-                fout.write(salts[i])
-                fout.write(prefixes[i])
-
-            index = 0
-            read_total = 0
-            buf = fin.read(CHUNK_SIZE)
-            while True:
-                if cancel_check and cancel_check():
-                    raise Cancelled()
-                nxt = fin.read(CHUNK_SIZE)
-                is_last = len(nxt) == 0
-                aad = struct.pack(">QB", index, 1 if is_last else 0)
-
-                current = buf
-                for i in range(layers):
-                    nonce = _nonce_for_chunk(prefixes[i], index)
-                    current = ciphers[i].encrypt(nonce, current, aad)
-
-                fout.write(struct.pack(">I", len(current)))
-                fout.write(current)
-
-                read_total += len(buf)
-                if progress_cb:
-                    progress_cb(min(99, int(read_total / total_size * 100)))
-
-                if is_last:
-                    break
-                buf = nxt
-                index += 1
-        if progress_cb:
-            progress_cb(100)
-    except Cancelled:
-        try:
-            dst_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
-
-
-def _read_header(fin):
-    magic = fin.read(4)
-    if magic != MAGIC:
-        raise CryptoError(
-            "Not a CryptVault v3 file (bad magic header). If this file was made with an "
-            "older version of this app, decrypt it with that version first."
-        )
-    _version = fin.read(1)[0]
-    layers = fin.read(1)[0]
-    is_folder = fin.read(1)[0] == 1
-    preset = fin.read(8).rstrip(b"\x00").decode("ascii")
-    cipher_ids, salts, prefixes = [], [], []
-    for _ in range(layers):
-        cipher_ids.append(fin.read(1)[0])
-        salts.append(fin.read(16))
-        prefixes.append(fin.read(4))
-    return layers, is_folder, preset, cipher_ids, salts, prefixes
-
-
-def decrypt_stream(src_path: Path, dst_path: Path, secret: bytes, progress_cb=None, cancel_check=None) -> bool:
-    """Returns True if the original was a folder. The cipher(s) used are
-    read automatically from the file's own header - the caller never needs
-    to know or specify which Encryption Type was used to encrypt it."""
-    total_size = max(src_path.stat().st_size, 1)
-    try:
-        with open(src_path, "rb") as fin:
-            layers, is_folder, preset, cipher_ids, salts, prefixes = _read_header(fin)
-            keys = [derive_key(secret + f"|layer{i}".encode(), salts[i], preset) for i in range(layers)]
-            ciphers = [_cipher_by_id(cipher_ids[i], keys[i]) for i in range(layers)]
-
-            with open(dst_path, "wb") as fout:
-                index = 0
-                while True:
-                    if cancel_check and cancel_check():
-                        raise Cancelled()
-                    len_bytes = fin.read(4)
-                    if len(len_bytes) < 4:
-                        break
-                    (clen,) = struct.unpack(">I", len_bytes)
-                    ciphertext = fin.read(clen)
-                    pos = fin.tell()
-                    is_last = pos >= total_size
-
-                    aad = struct.pack(">QB", index, 1 if is_last else 0)
-                    current = ciphertext
-                    try:
-                        for i in reversed(range(layers)):
-                            nonce = _nonce_for_chunk(prefixes[i], index)
-                            current = ciphers[i].decrypt(nonce, current, aad)
-                    except Exception:
-                        raise CryptoError("Wrong password (or wrong keyfile), or the file is corrupted/tampered.")
-
-                    fout.write(current)
-                    index += 1
-                    if progress_cb:
-                        progress_cb(min(99, int(pos / total_size * 100)))
-                    if is_last:
-                        break
-        if progress_cb:
-            progress_cb(100)
-        return is_folder
-    except Cancelled:
-        try:
-            dst_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
-
-
-def verify_password_quick(src_path: Path, secret: bytes) -> bool:
-    """Decrypts only the first chunk to confirm a password (and keyfile, if
-    any) - instant feedback even on huge files. Cipher(s) auto-detected."""
-    with open(src_path, "rb") as fin:
-        layers, is_folder, preset, cipher_ids, salts, prefixes = _read_header(fin)
-        keys = [derive_key(secret + f"|layer{i}".encode(), salts[i], preset) for i in range(layers)]
-        ciphers = [_cipher_by_id(cipher_ids[i], keys[i]) for i in range(layers)]
-
-        len_bytes = fin.read(4)
-        if len(len_bytes) < 4:
-            return False
-        (clen,) = struct.unpack(">I", len_bytes)
-        ciphertext = fin.read(clen)
-        pos = fin.tell()
-        total_size = src_path.stat().st_size
-        is_last = pos >= total_size
-        aad = struct.pack(">QB", 0, 1 if is_last else 0)
-        current = ciphertext
-        try:
-            for i in reversed(range(layers)):
-                nonce = _nonce_for_chunk(prefixes[i], 0)
-                current = ciphers[i].decrypt(nonce, current, aad)
-            return True
-        except Exception:
-            return False
-
-
-def describe_encryption_type(src_path: Path) -> str:
-    """Reads just the header to report which Encryption Type a .cvlt file
-    uses, without needing any password."""
-    with open(src_path, "rb") as fin:
-        layers, is_folder, preset, cipher_ids, salts, prefixes = _read_header(fin)
-    names = " + ".join(CIPHER_NAMES.get(c, f"unknown({c})") for c in cipher_ids)
-    return f"{names} ({layers} layer{'s' if layers != 1 else ''}, {preset} preset)"
-
-
-def zip_folder_to_file(folder_path: Path, dst_zip: Path, compress=True, progress_cb=None, cancel_check=None):
-    all_files = [p for p in folder_path.rglob("*") if p.is_file()]
-    total = max(len(all_files), 1)
-    method = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
-    with zipfile.ZipFile(dst_zip, "w", method) as zf:
-        for idx, file_path in enumerate(all_files):
-            if cancel_check and cancel_check():
-                raise Cancelled()
-            arcname = file_path.relative_to(folder_path.parent)
-            zf.write(file_path, arcname)
-            if progress_cb:
-                progress_cb(int((idx + 1) / total * 100))
-
-
-def unzip_file_to_folder(src_zip: Path, dest_dir: Path):
-    with zipfile.ZipFile(src_zip, "r") as zf:
-        zf.extractall(dest_dir)
-
-
-def shred_file(path: Path, passes: int = SHRED_PASSES):
-    try:
-        length = path.stat().st_size
-        with open(path, "r+b") as f:
-            for _ in range(passes):
-                f.seek(0)
-                f.write(secrets.token_bytes(length))
-                f.flush()
-                os.fsync(f.fileno())
-        path.unlink()
-    except Exception:
-        try:
-            path.unlink()
-        except Exception:
-            pass
-
-
-def shred_path(path: Path, passes: int = SHRED_PASSES):
-    if path.is_dir():
-        for f in path.rglob("*"):
-            if f.is_file():
-                shred_file(f, passes)
-        for d in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if d.is_dir():
-                try:
-                    d.rmdir()
-                except Exception:
-                    pass
-        try:
-            path.rmdir()
-        except Exception:
-            pass
-    else:
-        shred_file(path, passes)
-
-
-def password_strength(pw: str):
-    if not pw:
-        return 0, "", "#888888"
-    score = 0
-    if len(pw) >= 8:
-        score += 1
-    if len(pw) >= 14:
-        score += 1
-    if re.search(r"[A-Z]", pw) and re.search(r"[a-z]", pw):
-        score += 1
-    if re.search(r"\d", pw):
-        score += 1
-    if re.search(r"[^\w]", pw):
-        score += 1
-    score = min(score, 4)
-    labels = {0: ("Very weak", "#ff5b5b"), 1: ("Weak", "#ff8a5b"),
-              2: ("Fair", "#ffd15b"), 3: ("Strong", "#8bd85b"),
-              4: ("Very strong", "#4be0a0")}
-    label, color = labels[score]
-    return score, label, color
-
-
-def generate_password(length: int = 20) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*()-_=+"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def human_size(num_bytes: float) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if num_bytes < 1024:
-            return f"{num_bytes:.1f}{unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f}PB"
+from crypto_engine import (
+    CIPHER_NAMES,
+    ENCRYPTION_TYPES,
+    Cancelled,
+    CryptoError,
+    decrypt_stream,
+    describe_encryption_type,
+    encrypt_stream,
+    generate_password,
+    human_size,
+    password_strength,
+    publish_file,
+    secret_with_keyfile,
+    sha256_of_file,
+    shred_path,
+    snapshot_tree,
+    source_signature,
+    unzip_file_to_folder,
+    validate_source,
+    verify_password_quick,
+    verify_snapshot,
+    zip_folder_to_file,
+)
 
 
 def open_in_file_manager(path: Path):
@@ -498,14 +113,48 @@ def open_in_file_manager(path: Path):
 # ========================================================================
 class TaskSignals(QObject):
     progress = Signal(str, int)
-    done = Signal(str, str, float, int)
+    done = Signal(str, str, float, object)
     failed = Signal(str, str)
     cancelled = Signal(str)
 
 
+class UtilitySignals(QObject):
+    finished = Signal(str, str)
+
+
+class UtilityTask(QRunnable):
+    def __init__(self, kind, callback):
+        super().__init__()
+        self.kind = kind
+        self.callback = callback
+        self.cancel_event = threading.Event()
+        self.signals = UtilitySignals()
+
+    def run(self):
+        try:
+            message = self.callback(self.cancel_event)
+        except Cancelled:
+            message = f"[{self.kind.upper()}] Cancelled."
+        except Exception as exc:
+            message = f"[{self.kind.upper()}] Could not complete: {exc}"
+        finally:
+            self.callback = None
+        self.signals.finished.emit(self.kind, message)
+
+
 class CryptoTask(QRunnable):
-    def __init__(self, mode, path, secret, cipher_ids, preset, shred, output_dir, cancel_event,
-                 compress_folders=True):
+    def __init__(
+        self,
+        mode,
+        path,
+        secret,
+        cipher_ids,
+        preset,
+        shred,
+        output_dir,
+        cancel_event,
+        compress_folders=True,
+    ):
         super().__init__()
         self.mode = mode
         self.path = Path(path)
@@ -517,6 +166,9 @@ class CryptoTask(QRunnable):
         self.cancel_event = cancel_event
         self.compress_folders = compress_folders
         self.signals = TaskSignals()
+        self.keyfile_path = None
+        self.keyfile_signature = None
+        self._last_progress = -1
 
     def _cancel_check(self):
         return self.cancel_event.is_set()
@@ -527,73 +179,141 @@ class CryptoTask(QRunnable):
             if self._cancel_check():
                 self.signals.cancelled.emit(str(self.path))
                 return
+            if self.keyfile_path:
+                self.secret = secret_with_keyfile(
+                    self.secret,
+                    self.keyfile_path,
+                    self._cancel_check,
+                    self.keyfile_signature,
+                )
             if self.mode == "encrypt":
                 output = self._encrypt()
             else:
                 output = self._decrypt()
             size = Path(output).stat().st_size if Path(output).is_file() else 0
-            self.signals.done.emit(str(self.path), str(output), time.time() - start, size)
+            self.signals.done.emit(
+                str(self.path), str(output), time.time() - start, size
+            )
         except Cancelled:
             self.signals.cancelled.emit(str(self.path))
         except Exception as e:
             self.signals.failed.emit(str(self.path), str(e))
+        finally:
+            self.secret = b""
+
+    def _progress(self, value):
+        value = max(0, min(100, int(value)))
+        if value != self._last_progress:
+            self._last_progress = value
+            self.signals.progress.emit(str(self.path), value)
 
     def _dest_dir_for(self, original: Path) -> Path:
         return self.output_dir if self.output_dir else original.parent
 
     def _encrypt(self):
+        validate_source(self.path)
         is_folder = self.path.is_dir()
         dest_dir = self._dest_dir_for(self.path)
+        if is_folder and (
+            dest_dir.resolve() == self.path.resolve()
+            or self.path.resolve() in dest_dir.resolve().parents
+        ):
+            raise CryptoError("Choose an output folder outside the input folder.")
         dest_dir.mkdir(parents=True, exist_ok=True)
         out_name = dest_dir / (self.path.name + ".cvlt")
-
+        if os.path.lexists(out_name):
+            raise CryptoError(f"Output already exists: {out_name}")
+        snapshot = snapshot_tree(self.path, self._cancel_check) if self.shred else None
         if is_folder:
-            tmp_zip = Path(tempfile.mkstemp(suffix=".zip")[1])
-            try:
-                zip_folder_to_file(self.path, tmp_zip, compress=self.compress_folders,
-                                    progress_cb=lambda p: self.signals.progress.emit(str(self.path), int(p * 0.3)),
-                                    cancel_check=self._cancel_check)
-                encrypt_stream(tmp_zip, out_name, self.secret, self.cipher_ids, True, self.preset,
-                                progress_cb=lambda p: self.signals.progress.emit(str(self.path), 30 + int(p * 0.7)),
-                                cancel_check=self._cancel_check)
-            finally:
-                tmp_zip.unlink(missing_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=".cryptvault-", dir=dest_dir
+            ) as temporary:
+                tmp_zip = Path(temporary) / "folder.zip"
+                zip_folder_to_file(
+                    self.path,
+                    tmp_zip,
+                    compress=self.compress_folders,
+                    progress_cb=lambda p: self._progress(int(p * 0.3)),
+                    cancel_check=self._cancel_check,
+                    snapshot=snapshot,
+                )
+                encrypt_stream(
+                    tmp_zip,
+                    out_name,
+                    self.secret,
+                    self.cipher_ids,
+                    True,
+                    self.preset,
+                    progress_cb=lambda p: self._progress(30 + int(p * 0.7)),
+                    cancel_check=self._cancel_check,
+                )
         else:
-            encrypt_stream(self.path, out_name, self.secret, self.cipher_ids, False, self.preset,
-                            progress_cb=lambda p: self.signals.progress.emit(str(self.path), p),
-                            cancel_check=self._cancel_check)
-
+            encrypt_stream(
+                self.path,
+                out_name,
+                self.secret,
+                self.cipher_ids,
+                False,
+                self.preset,
+                progress_cb=self._progress,
+                cancel_check=self._cancel_check,
+            )
         if self.shred:
+            if self._cancel_check():
+                return out_name
+            verify_snapshot(self.path, snapshot, self._cancel_check)
             shred_path(self.path)
         return out_name
 
     def _decrypt(self):
+        validate_source(self.path)
         dest_dir = self._dest_dir_for(self.path)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        if self.path.suffix == ".cvlt":
-            target = dest_dir / self.path.stem
-        else:
-            target = dest_dir / (self.path.name + ".decrypted")
-
-        tmp_out = Path(tempfile.mkstemp()[1])
-        try:
-            # No cipher_ids passed in here - decrypt_stream reads them from
-            # the file's own header automatically.
-            is_folder = decrypt_stream(self.path, tmp_out, self.secret,
-                                        progress_cb=lambda p: self.signals.progress.emit(str(self.path), int(p * 0.8)),
-                                        cancel_check=self._cancel_check)
+        target = dest_dir / (
+            self.path.stem
+            if self.path.suffix.lower() == ".cvlt"
+            else self.path.name + ".decrypted"
+        )
+        original_stat = self.path.stat()
+        with self.path.open("rb") as source:
+            legacy = source.read(4) == b"CVL3"
+        if legacy and self.shred:
+            raise CryptoError(
+                "Legacy v3 headers are unauthenticated. Disable original deletion to recover this file."
+            )
+        # Temporary plaintext stays on the chosen output filesystem.
+        with tempfile.TemporaryDirectory(
+            prefix=".cryptvault-", dir=dest_dir
+        ) as temporary:
+            tmp_out = Path(temporary) / "plaintext"
+            is_folder = decrypt_stream(
+                self.path,
+                tmp_out,
+                self.secret,
+                progress_cb=lambda p: self._progress(int(p * 0.8)),
+                cancel_check=self._cancel_check,
+            )
+            if self._cancel_check():
+                raise Cancelled()
             if is_folder:
-                out_dir = dest_dir / (target.name + "_decrypted")
-                out_dir.mkdir(exist_ok=True, parents=True)
-                unzip_file_to_folder(tmp_out, out_dir)
-                result = out_dir
+                result = dest_dir / (target.name + "_decrypted")
+                unzip_file_to_folder(tmp_out, result, cancel_check=self._cancel_check)
             else:
-                target.write_bytes(tmp_out.read_bytes())
+                if os.path.lexists(target):
+                    raise CryptoError(f"Output already exists: {target}")
+                publish_file(tmp_out, target)
                 result = target
-        finally:
-            tmp_out.unlink(missing_ok=True)
-
-        if self.shred:
+        if self.shred and not self._cancel_check():
+            validate_source(self.path)
+            current = self.path.stat()
+            if (current.st_ino, current.st_size, current.st_mtime_ns) != (
+                original_stat.st_ino,
+                original_stat.st_size,
+                original_stat.st_mtime_ns,
+            ):
+                raise CryptoError(
+                    "Output saved, but input changed; original was not deleted."
+                )
             shred_path(self.path)
         return result
 
@@ -682,7 +402,7 @@ QWidget#Card {
     border-radius: 16px;
     border: 1px solid §PANEL_BORDER§;
 }
-QLabel#Title { color: §TITLE§; font-size: 24px; font-weight: 800; letter-spacing: 0.5px; }
+QLabel#Title { color: §TITLE§; font-size: 30px; font-weight: 700; letter-spacing: 0.5px; }
 QLabel#Subtitle { color: §SUBTITLE§; font-size: 12px; }
 QLabel { color: §TEXT§; font-size: 13px; }
 QLabel#SectionTag { color: §TAG§; font-size: 11px; font-weight: 800; letter-spacing: 1.2px; }
@@ -706,7 +426,7 @@ QComboBox QAbstractItemView {
 }
 QPushButton {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(150, 190, 255, 235), stop:1 rgba(110, 150, 235, 235));
+        stop:0 #438df7, stop:1 #2869dc);
     border: 1px solid rgba(255,255,255,90);
     border-radius: 14px;
     padding: 10px 16px;
@@ -716,7 +436,7 @@ QPushButton {
 }
 QPushButton:hover {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(170, 205, 255, 245), stop:1 rgba(125, 165, 245, 245));
+        stop:0 #5da1ff, stop:1 #377ce9);
 }
 QPushButton:pressed {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -746,6 +466,11 @@ QPushButton#Danger {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 rgba(240, 110, 110, 235), stop:1 rgba(210, 75, 75, 235));
 }
+QPushButton#Danger:disabled {
+    background: §SECONDARY_BTN_BG§;
+    color: §SUBTITLE§;
+    border: 1px solid §INPUT_BORDER§;
+}
 QPushButton#Danger:hover {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 rgba(250, 130, 130, 245), stop:1 rgba(225, 90, 90, 245));
@@ -758,7 +483,7 @@ QCheckBox::indicator {
 }
 QCheckBox::indicator:checked {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(150, 190, 255, 235), stop:1 rgba(110, 150, 235, 235));
+        stop:0 #438df7, stop:1 #2869dc);
     border: 1px solid rgba(255,255,255,180);
 }
 QProgressBar {
@@ -776,12 +501,15 @@ QProgressBar::chunk {
     border-radius: 7px;
 }
 QListWidget {
-    background-color: transparent;
-    border: none;
+    background-color: §CARD_BG§;
+    border: 1px dashed §INPUT_BORDER§;
+    border-radius: 18px;
+    padding: 8px;
     color: §TEXT_STRONG§;
     font-size: 12px;
 }
-QListWidget::item { border: none; padding: 2px; }
+QListWidget::item { border: 1px solid §PANEL_BORDER§; padding: 4px; border-radius: 12px; }
+QListWidget::item:selected { background: rgba(70,140,240,35); }
 QListWidget::item:selected { background: transparent; }
 QTextEdit {
     background-color: §LOG_BG§;
@@ -792,6 +520,9 @@ QTextEdit {
     font-family: Consolas, monospace;
     padding: 6px;
 }
+QLabel#Heading { color: §TEXT_STRONG§; font-size: 23px; font-weight: 600; }
+QLabel#Badge { color: §TAG§; background: §CARD_BG§; border: 1px solid §INPUT_BORDER§;
+    border-radius: 12px; padding: 6px 10px; font-size: 10px; font-weight: 700; }
 QLabel#Strength { font-size: 12px; font-weight: 700; }
 QScrollArea { border: none; background: transparent; }
 QScrollBar:vertical { background: transparent; width: 10px; }
@@ -814,14 +545,13 @@ QTabBar::tab {
     color: §TEXT_STRONG§;
     padding: 9px 16px;
     margin-right: 6px;
-    border-top-left-radius: 12px;
-    border-top-right-radius: 12px;
+    border-radius: 16px;
     font-weight: 700;
     font-size: 12px;
 }
 QTabBar::tab:selected {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-        stop:0 rgba(150, 190, 255, 235), stop:1 rgba(110, 150, 235, 235));
+        stop:0 #438df7, stop:1 #2869dc);
     color: white;
 }
 QDialog { background-color: §DIALOG_BG§; }
@@ -843,45 +573,44 @@ QHeaderView::section {
 """
 
 _DARK_TOKENS = {
-    "§PANEL_BG§": "rgba(255, 255, 255, 28)",
-    "§PANEL_BORDER§": "rgba(255, 255, 255, 65)",
-    "§CARD_BG§": "rgba(255, 255, 255, 20)",
-    "§TITLE§": "white",
-    "§SUBTITLE§": "rgba(255,255,255,185)",
-    "§TEXT§": "rgba(255,255,255,225)",
-    "§TEXT_STRONG§": "white",
-    "§TAG§": "rgba(255,255,255,150)",
-    "§INPUT_BG§": "rgba(255,255,255,45)",
-    "§INPUT_BORDER§": "rgba(255,255,255,90)",
-    "§DROPDOWN_BG§": "rgb(50, 55, 85)",
-    "§DIALOG_BG§": "rgb(38, 42, 68)",
-    "§SECONDARY_BTN_BG§": "rgba(255,255,255,35)",
-    "§SECONDARY_BTN_BORDER§": "rgba(255,255,255,80)",
-    "§SECONDARY_BTN_HOVER§": "rgba(255,255,255,60)",
-    "§LOG_BG§": "rgba(15,18,30,150)",
-    "§LOG_TEXT§": "rgba(255,255,255,235)",
-    "§SCROLLBAR§": "rgba(255,255,255,80)",
+    "§PANEL_BG§": "rgba(18, 29, 52, 215)",
+    "§PANEL_BORDER§": "rgba(210, 228, 255, 48)",
+    "§CARD_BG§": "rgba(233, 243, 255, 14)",
+    "§TITLE§": "#f5f8ff",
+    "§SUBTITLE§": "#b2c1d9",
+    "§TEXT§": "#dce6f5",
+    "§TEXT_STRONG§": "#f4f8ff",
+    "§TAG§": "#afc6e8",
+    "§INPUT_BG§": "rgba(9, 18, 38, 150)",
+    "§INPUT_BORDER§": "rgba(192, 217, 255, 52)",
+    "§DROPDOWN_BG§": "#1d2c47",
+    "§DIALOG_BG§": "#14223b",
+    "§SECONDARY_BTN_BG§": "rgba(235, 246, 255, 18)",
+    "§SECONDARY_BTN_BORDER§": "rgba(222, 239, 255, 48)",
+    "§SECONDARY_BTN_HOVER§": "rgba(213, 234, 255, 36)",
+    "§LOG_BG§": "rgba(7, 17, 35, 145)",
+    "§LOG_TEXT§": "#dce6f5",
+    "§SCROLLBAR§": "rgba(205, 224, 255, 65)",
 }
-
 _LIGHT_TOKENS = {
-    "§PANEL_BG§": "rgba(255, 255, 255, 150)",
-    "§PANEL_BORDER§": "rgba(255, 255, 255, 210)",
-    "§CARD_BG§": "rgba(255, 255, 255, 130)",
-    "§TITLE§": "rgb(25, 30, 55)",
-    "§SUBTITLE§": "rgba(30,35,65,170)",
-    "§TEXT§": "rgba(25,30,55,220)",
-    "§TEXT_STRONG§": "rgb(20, 25, 45)",
-    "§TAG§": "rgba(30,35,65,150)",
-    "§INPUT_BG§": "rgba(255,255,255,170)",
-    "§INPUT_BORDER§": "rgba(120,120,170,120)",
-    "§DROPDOWN_BG§": "rgb(240, 242, 250)",
-    "§DIALOG_BG§": "rgb(235, 238, 248)",
-    "§SECONDARY_BTN_BG§": "rgba(255,255,255,150)",
-    "§SECONDARY_BTN_BORDER§": "rgba(120,120,170,110)",
-    "§SECONDARY_BTN_HOVER§": "rgba(255,255,255,210)",
-    "§LOG_BG§": "rgba(255,255,255,185)",
-    "§LOG_TEXT§": "rgb(25, 30, 55)",
-    "§SCROLLBAR§": "rgba(80,80,110,90)",
+    "§PANEL_BG§": "rgba(255, 255, 255, 170)",
+    "§PANEL_BORDER§": "rgba(255, 255, 255, 240)",
+    "§CARD_BG§": "rgba(255, 255, 255, 120)",
+    "§TITLE§": "#172c49",
+    "§SUBTITLE§": "#52647f",
+    "§TEXT§": "#354963",
+    "§TEXT_STRONG§": "#182e4e",
+    "§TAG§": "#536b8c",
+    "§INPUT_BG§": "rgba(255, 255, 255, 210)",
+    "§INPUT_BORDER§": "rgba(79, 111, 156, 50)",
+    "§DROPDOWN_BG§": "#f3f7fd",
+    "§DIALOG_BG§": "#eff4fc",
+    "§SECONDARY_BTN_BG§": "rgba(255, 255, 255, 165)",
+    "§SECONDARY_BTN_BORDER§": "rgba(94, 123, 167, 48)",
+    "§SECONDARY_BTN_HOVER§": "rgba(224, 238, 255, 210)",
+    "§LOG_BG§": "rgba(255, 255, 255, 150)",
+    "§LOG_TEXT§": "#263e5f",
+    "§SCROLLBAR§": "rgba(71, 103, 149, 70)",
 }
 
 
@@ -923,6 +652,11 @@ class GradientBackground(QWidget):
             base.setColorAt(0.5, QColor(240, 228, 252))
             base.setColorAt(1.0, QColor(222, 245, 248))
         painter.fillRect(self.rect(), QBrush(base))
+        sheen = QLinearGradient(0, 0, w, h * 0.75)
+        sheen.setColorAt(0, QColor(255, 255, 255, 28 if self.dark else 110))
+        sheen.setColorAt(0.45, QColor(255, 255, 255, 0))
+        sheen.setColorAt(1, QColor(255, 255, 255, 16))
+        painter.fillRect(self.rect(), QBrush(sheen))
 
         blobs_dark = [
             (0.15, 0.20, 0.55, QColor(130, 100, 255, 100)),
@@ -956,16 +690,12 @@ class GlassPanel(QFrame):
         super().__init__()
         self.setObjectName("GlassPanel")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(55)
-        shadow.setColor(QColor(0, 0, 0, 150))
-        shadow.setOffset(0, 12)
-        self.setGraphicsEffect(shadow)
 
 
 class Card(QFrame):
     """A smaller frosted sub-panel used to group related controls -
     gives the layout visual hierarchy instead of one long flat stack."""
+
     def __init__(self):
         super().__init__()
         self.setObjectName("Card")
@@ -979,7 +709,7 @@ class DropList(QListWidget):
         self.setAcceptDrops(True)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumHeight(120)
+        self.setMinimumHeight(160)
         self.setSpacing(4)
         # QListWidget is a scroll area internally too - its viewport
         # auto-fills with an opaque background by default, which can hide
@@ -987,6 +717,33 @@ class DropList(QListWidget):
         # stylesheet override, which would wipe child widget styling too)
         # fixes that without touching anything else.
         self.viewport().setAutoFillBackground(False)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.count():
+            return
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.Antialiasing)
+        dark = self.palette().windowText().color().lightness() > 160
+        painter.setPen(QColor("#dbeafe" if dark else "#334768"))
+        center = self.viewport().rect().center()
+        painter.setFont(QFont(self.font().family(), 25))
+        painter.drawText(
+            QRect(0, center.y() - 62, self.viewport().width(), 40), Qt.AlignCenter, "↓"
+        )
+        painter.setFont(QFont(self.font().family(), 13, QFont.DemiBold))
+        painter.drawText(
+            QRect(0, center.y() - 15, self.viewport().width(), 30),
+            Qt.AlignCenter,
+            "Drop files & folders here",
+        )
+        painter.setFont(QFont(self.font().family(), 10))
+        painter.drawText(
+            QRect(0, center.y() + 20, self.viewport().width(), 28),
+            Qt.AlignCenter,
+            "or use Add Files and Add Folder below",
+        )
+        painter.end()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -996,7 +753,9 @@ class DropList(QListWidget):
         event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
-        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
+        paths = [
+            url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()
+        ]
         if paths:
             self.paths_added.emit(paths)
         event.acceptProposedAction()
@@ -1017,7 +776,12 @@ class FileRowWidget(QWidget):
         top_row = QHBoxLayout()
         kind = "📁" if Path(path).is_dir() else "📄"
         self.name_label = QLabel(f"{kind}  {Path(path).name}")
+        self.name_label.setTextFormat(Qt.PlainText)
+        self.name_label.setMinimumWidth(0)
+        self.name_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.name_label.setToolTip(str(path))
         self.name_label.setObjectName("RowName")
+        self.setToolTip(str(path))
         self.status_label = QLabel("Queued")
         self.status_label.setObjectName("RowStatus")
         top_row.addWidget(self.name_label, stretch=1)
@@ -1052,32 +816,28 @@ SPEED_RATING = {
     "AES-256-OCB3 (High Performance)": ("Very fast", "★★★★★"),
     "AES-256-CCM (Compact / IoT Standard)": ("Moderate", "★★★☆☆"),
     "Double Shield (AES-GCM + ChaCha20)": ("Slower (2 layers)", "★★☆☆☆"),
-    "Fort Knox (Triple Layer: AES-GCM + ChaCha20 + AES-GCM-SIV)": ("Slowest (3 layers)", "★☆☆☆☆"),
+    "Fort Knox (Triple Layer: AES-GCM + ChaCha20 + AES-GCM-SIV)": (
+        "Slowest (3 layers)",
+        "★☆☆☆☆",
+    ),
 }
 
 REAL_WORLD_USE = {
-    "AES-256-GCM (Standard)":
-        "Used extensively in TLS (the encryption behind HTTPS), many VPNs, and disk "
-        "encryption products. The most common authenticated cipher in production software.",
-    "ChaCha20-Poly1305 (Software-Friendly)":
-        "Used as an alternative cipher suite in TLS 1.3, and is the sole cipher used by "
-        "the WireGuard VPN protocol.",
-    "AES-256-GCM-SIV (Misuse-Resistant)":
-        "Standardized in RFC 8452, developed with input from Google engineers specifically "
-        "to reduce the damage from accidental nonce reuse in large-scale systems.",
-    "AES-256-OCB3 (High Performance)":
-        "Standardized in RFC 7253. Its adoption was historically limited by patents that "
-        "held until 2021 - it's now free to use anywhere, and is prized in performance-"
-        "critical systems that need maximum throughput.",
-    "AES-256-CCM (Compact / IoT Standard)":
-        "The cipher behind WPA2 Wi-Fi security (CCMP), Bluetooth Low Energy, and Zigbee - "
-        "chosen there for its compact, well-analyzed design suited to constrained devices.",
-    "Double Shield (AES-GCM + ChaCha20)":
-        "A layered construction, not a single standardized cipher - used here purely for "
-        "extra defense-in-depth on your own files.",
-    "Fort Knox (Triple Layer: AES-GCM + ChaCha20 + AES-GCM-SIV)":
-        "A layered construction combining three independent, standardized ciphers for "
-        "maximum redundancy against any single algorithm ever being broken.",
+    "AES-256-GCM (Standard)": "Used extensively in TLS (the encryption behind HTTPS), many VPNs, and disk "
+    "encryption products. The most common authenticated cipher in production software.",
+    "ChaCha20-Poly1305 (Software-Friendly)": "Used as an alternative cipher suite in TLS 1.3, and is the sole cipher used by "
+    "the WireGuard VPN protocol.",
+    "AES-256-GCM-SIV (Misuse-Resistant)": "Standardized in RFC 8452, developed with input from Google engineers specifically "
+    "to reduce the damage from accidental nonce reuse in large-scale systems.",
+    "AES-256-OCB3 (High Performance)": "Standardized in RFC 7253. Its adoption was historically limited by patents that "
+    "held until 2021 - it's now free to use anywhere, and is prized in performance-"
+    "critical systems that need maximum throughput.",
+    "AES-256-CCM (Compact / IoT Standard)": "The cipher behind WPA2 Wi-Fi security (CCMP), Bluetooth Low Energy, and Zigbee - "
+    "chosen there for its compact, well-analyzed design suited to constrained devices.",
+    "Double Shield (AES-GCM + ChaCha20)": "A layered construction, not a single standardized cipher - used here purely for "
+    "extra defense-in-depth on your own files.",
+    "Fort Knox (Triple Layer: AES-GCM + ChaCha20 + AES-GCM-SIV)": "A layered construction combining three independent, standardized ciphers for "
+    "maximum redundancy against any single algorithm ever being broken.",
 }
 
 
@@ -1160,14 +920,18 @@ class ComparisonDialog(QDialog):
         self.resize(760, 420)
         layout = QVBoxLayout(self)
 
-        intro = QLabel("All of these are strong, modern authenticated ciphers - none is "
-                        "\"weak\". The differences are speed, hardware support, and how many "
-                        "independent layers are used.")
+        intro = QLabel(
+            "All of these are strong, modern authenticated ciphers - none is "
+            '"weak". The differences are speed, hardware support, and how many '
+            "independent layers are used."
+        )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         table = QTableWidget(len(ENCRYPTION_TYPES), 4)
-        table.setHorizontalHeaderLabels(["Type", "Algorithm Chain", "Relative Speed", "Best For"])
+        table.setHorizontalHeaderLabels(
+            ["Type", "Algorithm Chain", "Relative Speed", "Best For"]
+        )
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -1200,21 +964,27 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CryptVault")
-        self.setMinimumSize(360, 460)
+        self.setMinimumSize(460, 580)
 
         self.settings = QSettings("CryptVault", "CryptVault")
 
         self.selected_paths = []
-        self.row_widgets = {}   # path -> FileRowWidget
-        self.list_items = {}    # path -> QListWidgetItem
-        self.output_dir = self.settings.value("output_dir", "", str) or None
-        self.last_dir = self.settings.value("last_dir", str(Path.home()), str)
-        self.dark_mode = self.settings.value("dark_mode", True, bool)
+        self.row_widgets = {}  # path -> FileRowWidget
+        self.output_dir = self._setting("output_dir", "", str) or None
+        self.last_dir = self._setting("last_dir", str(Path.home()), str)
+        self.dark_mode = self._setting("dark_mode", False, bool)
         self.last_output_dir = None
         self.keyfile_path = None
 
-        self.pool = QThreadPool.globalInstance()
-        self.pool.setMaxThreadCount(max(2, min(4, os.cpu_count() or 2)))
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(2)
+        self.active_tasks = {}
+        self.utility_tasks = {}
+        self._task_progress = {}
+        self._progress_total = 0
+        self._batch_failed = 0
+        self._batch_cancelled = 0
+        self._closing = False
         self.cancel_event = threading.Event()
         self.total_tasks = 0
         self.completed_tasks = 0
@@ -1229,8 +999,25 @@ class MainWindow(QWidget):
         self._apply_theme()
         self._restore_settings()
 
-        size = self.settings.value("window_size", None)
-        self.resize(size if size else QSize(760, 900))
+        size = self._setting("window_size", None)
+        size = size if isinstance(size, QSize) and size.isValid() else QSize(920, 880)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry().size() if screen else QSize(1280, 960)
+        self.resize(size.boundedTo(available).expandedTo(self.minimumSize()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "local_badge"):
+            self.local_badge.setVisible(self.width() >= 640)
+            self.footer_note.setVisible(self.width() >= 640)
+
+    def _setting(self, key, default=None, value_type=None):
+        try:
+            if value_type is None:
+                return self.settings.value(key, default)
+            return self.settings.value(key, default, value_type)
+        except (TypeError, ValueError, OverflowError):
+            return default
 
     # ---------------- UI construction ----------------
     def _build_ui(self):
@@ -1239,33 +1026,54 @@ class MainWindow(QWidget):
 
         self.bg = GradientBackground(dark=True)
         bg_layout = QVBoxLayout(self.bg)
-        bg_layout.setContentsMargins(18, 18, 18, 18)
+        bg_layout.setContentsMargins(24, 24, 24, 16)
         bg_layout.setSpacing(12)
 
-        header_row = FlowLayout(spacing=8)
-        title = QLabel("🔒  CryptVault")
+        header_row = QHBoxLayout()
+        wordmark = QVBoxLayout()
+        wordmark.setSpacing(2)
+        title = QLabel("CryptVault")
         title.setObjectName("Title")
-        self.theme_btn = QPushButton("☀️ Light" if self.dark_mode else "🌙 Dark")
+        subtitle = QLabel("Your files. Your password. Your space.")
+        subtitle.setObjectName("Subtitle")
+        subtitle.setWordWrap(True)
+        wordmark.addWidget(title)
+        wordmark.addWidget(subtitle)
+        header_row.addLayout(wordmark, stretch=1)
+        badge = QLabel("●  ON YOUR DEVICE")
+        badge.setObjectName("Badge")
+        self.local_badge = badge
+        header_row.addWidget(badge)
+        self.theme_btn = QPushButton("Dark")
         self.theme_btn.setObjectName("Secondary")
+        self.theme_btn.setToolTip("Switch between light and dark glass")
         self.theme_btn.clicked.connect(self.toggle_theme)
-        header_row.addWidget(title)
         header_row.addWidget(self.theme_btn)
         bg_layout.addLayout(header_row)
 
         panel = GlassPanel()
         panel_outer = QVBoxLayout(panel)
-        panel_outer.setContentsMargins(18, 18, 18, 18)
+        panel_outer.setContentsMargins(18, 16, 18, 18)
         panel_outer.setSpacing(10)
 
         self.tabs = QTabWidget()
         panel_outer.addWidget(self.tabs)
 
-        self.tabs.addTab(self._build_files_tab(), "Encrypt / Decrypt")
-        self.tabs.addTab(self._build_encryption_tab(), "Encryption Type")
+        self.tabs.addTab(self._build_files_tab(), "Files")
+        self.tabs.addTab(self._build_encryption_tab(), "Ciphers")
         self.tabs.addTab(self._build_settings_tab(), "Settings")
-        self.tabs.addTab(self._build_log_tab(), "Activity Log")
+        self.tabs.addTab(self._build_log_tab(), "Activity")
 
         bg_layout.addWidget(panel, stretch=1)
+        footer = QHBoxLayout()
+        self.status_label = QLabel("Ready when you are")
+        self.status_label.setObjectName("Subtitle")
+        footer.addWidget(self.status_label, stretch=1)
+        footer_note = QLabel("No accounts. No cloud.")
+        footer_note.setObjectName("Subtitle")
+        self.footer_note = footer_note
+        footer.addWidget(footer_note)
+        bg_layout.addLayout(footer)
         root.addWidget(self.bg)
 
     def _wrap_scroll(self, inner_widget):
@@ -1281,37 +1089,57 @@ class MainWindow(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.viewport().setAutoFillBackground(False)
         scroll.setWidget(inner_widget)
+        inner_widget.setAutoFillBackground(False)
         return scroll
 
     def _build_files_tab(self):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
-
-        layout.addWidget(self._tag("FILES / FOLDERS  (drag & drop supported)"))
+        layout.setContentsMargins(4, 16, 4, 4)
+        intro_row = QHBoxLayout()
+        intro = QLabel("Make private, stay private.")
+        intro.setObjectName("Heading")
+        self.queue_label = QLabel("0 items")
+        self.queue_label.setObjectName("Badge")
+        intro_row.addWidget(intro, stretch=1)
+        intro_row.addWidget(self.queue_label)
+        layout.addLayout(intro_row)
+        description = QLabel("Add files or folders, then choose Encrypt or Decrypt.")
+        description.setObjectName("Subtitle")
+        description.setWordWrap(True)
+        layout.addWidget(description)
         self.file_list = DropList()
         self.file_list.paths_added.connect(self.add_paths)
         self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self.show_file_context_menu)
         layout.addWidget(self.file_list, stretch=2)
 
+        self.picker_buttons = []
         picker_row = FlowLayout(spacing=8)
-        for label, slot in [("Add Files", self.choose_files), ("Add Folder", self.choose_folder),
-                             ("Remove Selected", self.remove_selected), ("Clear All", self.clear_list)]:
+        for label, slot in [
+            ("Add Files", self.choose_files),
+            ("Add Folder", self.choose_folder),
+            ("Remove Selected", self.remove_selected),
+            ("Clear All", self.clear_list),
+        ]:
             btn = QPushButton(label)
             btn.setObjectName("Secondary")
             btn.clicked.connect(slot)
+            self.picker_buttons.append(btn)
             picker_row.addWidget(btn)
         layout.addLayout(picker_row)
 
         pw_card = Card()
         pw_layout = QVBoxLayout(pw_card)
-        pw_layout.addWidget(self._tag("PASSWORD"))
-        pw_row = FlowLayout(spacing=8)
+        pw_layout.setContentsMargins(18, 16, 18, 16)
+        pw_layout.setSpacing(10)
+        pw_layout.addWidget(self._tag("YOUR PASSWORD"))
+        pw_row = QHBoxLayout()
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
         self.password_input.setPlaceholderText("Enter a strong password")
-        self.password_input.setMinimumWidth(200)
+        self.password_input.setMinimumWidth(120)
         self.password_input.textChanged.connect(self.on_password_activity)
         btn_generate = QPushButton("Generate")
         btn_generate.setObjectName("Secondary")
@@ -1322,6 +1150,7 @@ class MainWindow(QWidget):
 
         self.strength_label = QLabel("")
         self.strength_label.setObjectName("Strength")
+        self.strength_label.hide()
         pw_layout.addWidget(self.strength_label)
 
         self.confirm_input = QLineEdit()
@@ -1342,12 +1171,12 @@ class MainWindow(QWidget):
         layout.addWidget(pw_card)
 
         action_row = FlowLayout(spacing=8)
-        self.btn_encrypt = QPushButton("🔐  Encrypt All")
+        self.btn_encrypt = QPushButton("Encrypt files  →")
         self.btn_encrypt.clicked.connect(self.start_encrypt)
-        self.btn_decrypt = QPushButton("🔓  Decrypt All")
+        self.btn_decrypt = QPushButton("Decrypt files")
         self.btn_decrypt.setObjectName("Secondary")
         self.btn_decrypt.clicked.connect(self.start_decrypt)
-        self.btn_cancel = QPushButton("✕ Cancel")
+        self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setObjectName("Danger")
         self.btn_cancel.clicked.connect(self.cancel_batch)
         self.btn_cancel.setEnabled(False)
@@ -1356,8 +1185,15 @@ class MainWindow(QWidget):
         action_row.addWidget(self.btn_cancel)
         layout.addLayout(action_row)
 
-        layout.addWidget(self._tag("OVERALL PROGRESS"))
+        self.destination_note = QLabel(
+            "Saves beside the original · Existing files are kept"
+        )
+        self.destination_note.setObjectName("Subtitle")
+        self.destination_note.setWordWrap(True)
+        layout.addWidget(self.destination_note)
         self.overall_bar = QProgressBar()
+        self.overall_bar.setValue(0)
+        self.overall_bar.setFormat("%p%")
         layout.addWidget(self.overall_bar)
 
         return self._wrap_scroll(content)
@@ -1367,10 +1203,16 @@ class MainWindow(QWidget):
         layout = QVBoxLayout(content)
         layout.setSpacing(10)
 
-        layout.addWidget(self._tag("ENCRYPTION TYPE  (decrypting never needs you to remember this)"))
+        layout.addWidget(
+            self._tag("ENCRYPTION TYPE  (decrypting never needs you to remember this)")
+        )
         enc_row = FlowLayout(spacing=8)
         self.encryption_combo = QComboBox()
-        self.encryption_combo.setMinimumWidth(260)
+        self.encryption_combo.setMinimumWidth(220)
+        self.encryption_combo.setMinimumContentsLength(20)
+        self.encryption_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
         for et in ENCRYPTION_TYPES:
             self.encryption_combo.addItem(et["name"])
         self.encryption_combo.setCurrentIndex(0)
@@ -1394,15 +1236,19 @@ class MainWindow(QWidget):
         self.encryption_speed.setTextFormat(Qt.RichText)
         summary_layout.addWidget(self.encryption_speed)
         layout.addWidget(summary_card)
-        self.encryption_combo.currentIndexChanged.connect(self._update_encryption_summary)
+        self.encryption_combo.currentIndexChanged.connect(
+            self._update_encryption_summary
+        )
         self._update_encryption_summary(0)
 
         layout.addWidget(self._tag("PASSWORD SECURITY LEVEL"))
         sec_row = FlowLayout(spacing=8)
         sec_row.addWidget(QLabel("How expensive password cracking should be:"))
         self.security_combo = QComboBox()
-        self.security_combo.addItems(["Fast", "Balanced (recommended)", "Paranoid (slow)"])
-        self.security_combo.setCurrentIndex(1)
+        self.security_combo.addItems(
+            ["Fast (16 MB)", "Balanced (32 MB)", "Paranoid (128 MB, recommended)"]
+        )
+        self.security_combo.setCurrentIndex(2)
         sec_row.addWidget(self.security_combo)
         layout.addLayout(sec_row)
 
@@ -1440,9 +1286,13 @@ class MainWindow(QWidget):
 
         key_card = Card()
         key_layout = QVBoxLayout(key_card)
-        key_layout.addWidget(self._tag("KEYFILE (OPTIONAL - PASSWORD + FILE BOTH REQUIRED)"))
+        key_layout.addWidget(
+            self._tag("KEYFILE (OPTIONAL - PASSWORD + FILE BOTH REQUIRED)")
+        )
         self.keyfile_input = QLineEdit()
-        self.keyfile_input.setPlaceholderText("(none - password alone unlocks the file)")
+        self.keyfile_input.setPlaceholderText(
+            "(none - password alone unlocks the file)"
+        )
         self.keyfile_input.setReadOnly(True)
         key_layout.addWidget(self.keyfile_input)
         keyfile_row = FlowLayout(spacing=8)
@@ -1464,9 +1314,12 @@ class MainWindow(QWidget):
         opts_card = Card()
         opts_layout = QVBoxLayout(opts_card)
         opts_layout.addWidget(self._tag("OPTIONS"))
-        self.shred_original = QCheckBox("Securely delete original after success (3-pass overwrite)")
+        self.shred_original = QCheckBox("Delete originals after success")
+        self.shred_original.setToolTip(
+            "Cannot guarantee erasure on SSDs, snapshots, backups, or journaled filesystems."
+        )
         opts_layout.addWidget(self.shred_original)
-        self.compress_folders = QCheckBox("Compress folders before encrypting (smaller output, a bit slower)")
+        self.compress_folders = QCheckBox("Compress folders before encrypting")
         self.compress_folders.setChecked(True)
         opts_layout.addWidget(self.compress_folders)
         self.play_sound = QCheckBox("Play a sound when a batch finishes")
@@ -1491,6 +1344,7 @@ class MainWindow(QWidget):
 
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_box.document().setMaximumBlockCount(2000)
         self.log_box.setMinimumHeight(200)
         layout.addWidget(self.log_box, stretch=1)
 
@@ -1502,15 +1356,22 @@ class MainWindow(QWidget):
         lbl.setObjectName("SectionTag")
         return lbl
 
-    # Note: this used to also call an undocumented Windows API
-    # (SetWindowCompositionAttribute) for a real OS-level blur-behind
-    # effect. It was removed because that API's behavior is inconsistent
-    # across Windows builds/updates - it can render fine on one PC and
-    # broken on another with identical code, which is exactly the kind of
-    # bug that's painful to track down. The painted GradientBackground
-    # above gives a liquid-glass look on its own, consistently, everywhere.
-
     def closeEvent(self, event):
+        if (
+            self.total_tasks > self.completed_tasks
+            or self.utility_tasks
+            or self.pool.activeThreadCount()
+        ):
+            self._closing = True
+            self.cancel_event.set()
+            for task in self.utility_tasks.values():
+                task.cancel_event.set()
+            self.status_label.setText("Finishing safely…")
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
+        self.password_input.clear()
+        self.confirm_input.clear()
         self.settings.setValue("last_dir", self.last_dir)
         self.settings.setValue("output_dir", self.output_dir or "")
         self.settings.setValue("dark_mode", self.dark_mode)
@@ -1523,22 +1384,40 @@ class MainWindow(QWidget):
         super().closeEvent(event)
 
     def _restore_settings(self):
-        idx = self.settings.value("security_index", 1, int)
-        self.security_combo.setCurrentIndex(idx)
-        enc_idx = self.settings.value("encryption_index", 0, int)
+        idx = self._setting("security_index", 2, int)
+        self.security_combo.setCurrentIndex(idx if 0 <= idx < 3 else 2)
+        enc_idx = self._setting("encryption_index", 0, int)
         if 0 <= enc_idx < len(ENCRYPTION_TYPES):
             self.encryption_combo.setCurrentIndex(enc_idx)
-        self.shred_original.setChecked(self.settings.value("shred_original", False, bool))
-        self.compress_folders.setChecked(self.settings.value("compress_folders", True, bool))
-        self.play_sound.setChecked(self.settings.value("play_sound", False, bool))
+        self.shred_original.setChecked(False)
+        self.compress_folders.setChecked(self._setting("compress_folders", True, bool))
+        self.play_sound.setChecked(self._setting("play_sound", False, bool))
         if self.output_dir:
             self.output_input.setText(self.output_dir)
+            self.destination_note.setText(
+                f"Saves to {self.output_dir} · Existing files are kept"
+            )
 
     # ---------------- Theme ----------------
     def _apply_theme(self):
         self.setStyleSheet(build_qss(self.dark_mode))
         self.bg.set_dark(self.dark_mode)
-        self.theme_btn.setText("☀️ Light" if self.dark_mode else "🌙 Dark")
+        palette = self.palette()
+        palette.setColor(
+            QPalette.WindowText, QColor("#e1ebfa" if self.dark_mode else "#243b5a")
+        )
+        palette.setColor(
+            QPalette.Text, QColor("#e1ebfa" if self.dark_mode else "#243b5a")
+        )
+        palette.setColor(
+            QPalette.Window, QColor("#14223b" if self.dark_mode else "#eff4fc")
+        )
+        palette.setColor(
+            QPalette.Base, QColor("#14223b" if self.dark_mode else "#f6f9ff")
+        )
+        self.setPalette(palette)
+        self.file_list.viewport().update()
+        self.theme_btn.setText("Light mode" if self.dark_mode else "Dark mode")
 
     def toggle_theme(self):
         self.dark_mode = not self.dark_mode
@@ -1577,49 +1456,70 @@ class MainWindow(QWidget):
             self.log("Password fields auto-cleared after 5 minutes of inactivity.")
 
     def update_strength(self, text):
+        self.strength_label.setVisible(bool(text))
         score, label, color = password_strength(text)
         self.strength_label.setText(label)
-        self.strength_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 700;")
+        self.strength_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: 700;"
+        )
 
     def fill_generated_password(self):
         pw = generate_password()
-        self.password_input.setEchoMode(QLineEdit.Normal)
-        self.confirm_input.setEchoMode(QLineEdit.Normal)
-        self.show_pw_checkbox.setChecked(True)
+        self.show_pw_checkbox.setChecked(False)
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.confirm_input.setEchoMode(QLineEdit.Password)
         self.password_input.setText(pw)
         self.confirm_input.setText(pw)
-        self.log("Generated a new 20-character random password. Copy it somewhere safe now - it is not stored anywhere.")
+        self.log(
+            "Generated a new 20-character random password. Copy it somewhere safe now - it is not stored anywhere."
+        )
 
     def verify_password(self):
-        cvlt_files = [p for p in self.selected_paths if p.endswith(".cvlt")]
-        if not cvlt_files:
-            QMessageBox.information(self, "Nothing to verify", "Add at least one .cvlt file first.")
+        cvlt_files = [p for p in self.selected_paths if p.lower().endswith(".cvlt")]
+        if not cvlt_files or not self.password_input.text():
+            QMessageBox.information(
+                self, "Check password", "Add a .cvlt file and enter its password first."
+            )
             return
-        if not self.password_input.text():
-            QMessageBox.warning(self, "Missing password", "Enter a password first.")
-            return
-        target = cvlt_files[0]
-        try:
-            detected = describe_encryption_type(Path(target))
-            ok = verify_password_quick(Path(target), self._build_secret())
-        except Exception as e:
-            self.log(f"[VERIFY] Could not check {target}: {e}")
-            return
-        if ok:
-            self.log(f"[VERIFY] ✓ Password (and keyfile, if any) correct for {Path(target).name} - detected: {detected}")
-        else:
-            self.log(f"[VERIFY] ✗ Password/keyfile is WRONG for {Path(target).name} - detected: {detected}")
+        target = Path(cvlt_files[0])
+        secret, keyfile = self.password_input.text().encode("utf-8"), self.keyfile_path
+
+        def verify(cancel):
+            mixed = (
+                secret_with_keyfile(secret, keyfile, cancel.is_set)
+                if keyfile
+                else secret
+            )
+            if cancel.is_set():
+                raise Cancelled()
+            detected = describe_encryption_type(target)
+            ok = verify_password_quick(target, mixed)
+            if cancel.is_set():
+                raise Cancelled()
+            return (
+                f"[VERIFY] {target.name}: first chunk authenticated ({detected})."
+                if ok
+                else f"[VERIFY] {target.name}: wrong password/keyfile or damaged file."
+            )
+
+        self._start_utility("verify", verify)
 
     # ---------------- Output location ----------------
     def choose_output_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Choose output folder", self.last_dir)
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose output folder", self.last_dir
+        )
         if path:
             self.output_dir = path
             self.output_input.setText(path)
+            self.destination_note.setText(f"Saves to {path} · Existing files are kept")
 
     def reset_output_dir(self):
         self.output_dir = None
         self.output_input.setText("")
+        self.destination_note.setText(
+            "Saves beside the original · Existing files are kept"
+        )
 
     def open_output_folder(self):
         if self.last_output_dir:
@@ -1631,30 +1531,32 @@ class MainWindow(QWidget):
         if path:
             self.keyfile_path = path
             self.keyfile_input.setText(path)
-            self.log(f"Keyfile set: {Path(path).name} - both this file AND the password will be required.")
+            self.log(
+                f"Keyfile set: {Path(path).name} - both this file AND the password will be required."
+            )
 
     def generate_keyfile(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save new keyfile", "cryptvault.key", "Key files (*.key)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save new keyfile", "cryptvault.key", "Key files (*.key)"
+        )
         if not path:
             return
-        Path(path).write_bytes(secrets.token_bytes(256))
+        try:
+            with open(path, "xb") as output:
+                output.write(secrets.token_bytes(256))
+        except OSError as exc:
+            QMessageBox.warning(self, "Keyfile not saved", str(exc))
+            return
         self.keyfile_path = path
         self.keyfile_input.setText(path)
-        self.log(f"Generated a new keyfile at {path}. Keep this file safe and BACKED UP - "
-                 "losing it means anything encrypted with it becomes unrecoverable, even with the right password.")
+        self.log(
+            f"Generated a new keyfile at {path}. Keep this file safe and BACKED UP - "
+            "losing it means anything encrypted with it becomes unrecoverable, even with the right password."
+        )
 
     def clear_keyfile(self):
         self.keyfile_path = None
         self.keyfile_input.setText("")
-
-    def _build_secret(self) -> bytes:
-        keyfile_bytes = None
-        if self.keyfile_path:
-            try:
-                keyfile_bytes = Path(self.keyfile_path).read_bytes()
-            except Exception as e:
-                self.log(f"[WARNING] Could not read keyfile: {e}")
-        return build_secret(self.password_input.text(), keyfile_bytes)
 
     # ---------------- File selection ----------------
     def choose_files(self):
@@ -1670,8 +1572,11 @@ class MainWindow(QWidget):
             self.add_paths([path])
 
     def add_paths(self, paths):
+        if self.total_tasks > self.completed_tasks:
+            return
+        paths = [str(Path(p).absolute()) for p in paths if Path(p).exists()]
         for p in paths:
-            if p not in self.selected_paths:
+            if p not in self.row_widgets:
                 self.selected_paths.append(p)
                 row_widget = FileRowWidget(p)
                 item = QListWidgetItem()
@@ -1680,21 +1585,29 @@ class MainWindow(QWidget):
                 self.file_list.addItem(item)
                 self.file_list.setItemWidget(item, row_widget)
                 self.row_widgets[p] = row_widget
-                self.list_items[p] = item
+        self._update_queue()
+
+    def _update_queue(self):
+        count = len(self.selected_paths)
+        self.queue_label.setText(f"{count} item{'s' if count != 1 else ''}")
 
     def remove_selected(self):
+        if self.total_tasks > self.completed_tasks:
+            return
         for item in self.file_list.selectedItems():
             row = self.file_list.row(item)
             path = self.selected_paths.pop(row)
             self.row_widgets.pop(path, None)
-            self.list_items.pop(path, None)
             self.file_list.takeItem(row)
+        self._update_queue()
 
     def clear_list(self):
+        if self.total_tasks > self.completed_tasks:
+            return
         self.selected_paths = []
         self.row_widgets = {}
-        self.list_items = {}
         self.file_list.clear()
+        self._update_queue()
 
     def show_file_context_menu(self, pos):
         item = self.file_list.itemAt(pos)
@@ -1716,9 +1629,11 @@ class MainWindow(QWidget):
             hash_action = QAction("Compute SHA-256", self)
             hash_action.triggered.connect(lambda: self._compute_hash(path))
             menu.addAction(hash_action)
-            if path.endswith(".cvlt"):
+            if path.lower().endswith(".cvlt"):
                 info_action = QAction("Show Encryption Type Used", self)
-                info_action.triggered.connect(lambda: self._show_file_encryption_type(path))
+                info_action.triggered.connect(
+                    lambda: self._show_file_encryption_type(path)
+                )
                 menu.addAction(info_action)
 
         open_action = QAction("Open Containing Folder", self)
@@ -1730,11 +1645,35 @@ class MainWindow(QWidget):
         menu.exec(self.file_list.mapToGlobal(pos))
 
     def _compute_hash(self, path):
-        try:
-            digest = sha256_of_file(Path(path))
-            self.log(f"[SHA-256] {Path(path).name}: {digest}")
-        except Exception as e:
-            self.log(f"[SHA-256] Could not hash {path}: {e}")
+        def compute(cancel):
+            digest = sha256_of_file(Path(path), cancel_check=cancel.is_set)
+            return f"[SHA-256] {Path(path).name}: {digest}"
+
+        self._start_utility("hash", compute)
+
+    def _start_utility(self, kind, callback):
+        if (
+            self._closing
+            or kind in self.utility_tasks
+            or self.total_tasks > self.completed_tasks
+        ):
+            return
+        task = UtilityTask(kind, callback)
+        self.utility_tasks[kind] = task
+        task.signals.finished.connect(self._utility_finished, Qt.QueuedConnection)
+        self.btn_cancel.setEnabled(True)
+        self.status_label.setText(
+            "Checking password…" if kind == "verify" else "Calculating SHA-256…"
+        )
+        self.pool.start(task)
+
+    @Slot(str, str)
+    def _utility_finished(self, kind, message):
+        self.utility_tasks.pop(kind, None)
+        self.log(message)
+        if not self.utility_tasks:
+            self.btn_cancel.setEnabled(False)
+            self.status_label.setText("Ready when you are")
 
     def _show_file_encryption_type(self, path):
         try:
@@ -1747,24 +1686,33 @@ class MainWindow(QWidget):
         if not self.password_input.text():
             QMessageBox.warning(self, "Missing password", "Enter a password first.")
             return
-        if mode == "encrypt" and self.password_input.text() != self.confirm_input.text():
-            QMessageBox.warning(self, "Password mismatch", "Password and confirmation don't match.")
+        if (
+            mode == "encrypt"
+            and self.password_input.text() != self.confirm_input.text()
+        ):
+            QMessageBox.warning(
+                self, "Password mismatch", "Password and confirmation don't match."
+            )
             return
         self._run_batch(mode, paths=[path])
 
     def _remove_row(self, row):
+        if self.total_tasks > self.completed_tasks:
+            return
         path = self.selected_paths.pop(row)
         self.row_widgets.pop(path, None)
-        self.list_items.pop(path, None)
         self.file_list.takeItem(row)
+        self._update_queue()
 
     # ---------------- Logging ----------------
     def log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_box.append(f"[{timestamp}] {message}")
+        self.log_box.append(html.escape(f"[{timestamp}] {message}"))
 
     def save_log(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save log", "cryptvault_log.txt", "Text files (*.txt)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save log", "cryptvault_log.txt", "Text files (*.txt)"
+        )
         if path:
             Path(path).write_text(self.log_box.toPlainText(), encoding="utf-8")
             self.log(f"Log saved to {path}")
@@ -1775,13 +1723,17 @@ class MainWindow(QWidget):
 
     def _validate(self, is_encrypt):
         if not self.selected_paths:
-            QMessageBox.warning(self, "Missing input", "Add at least one file or folder.")
+            QMessageBox.warning(
+                self, "Missing input", "Add at least one file or folder."
+            )
             return False
         if not self.password_input.text():
             QMessageBox.warning(self, "Missing password", "Enter a password.")
             return False
         if is_encrypt and self.password_input.text() != self.confirm_input.text():
-            QMessageBox.warning(self, "Password mismatch", "Password and confirmation don't match.")
+            QMessageBox.warning(
+                self, "Password mismatch", "Password and confirmation don't match."
+            )
             return False
         return True
 
@@ -1799,17 +1751,68 @@ class MainWindow(QWidget):
         self.btn_encrypt.setEnabled(not running)
         self.btn_decrypt.setEnabled(not running)
         self.btn_cancel.setEnabled(running)
+        self.tabs.setTabEnabled(1, not running)
+        self.tabs.setTabEnabled(2, not running)
+        self.file_list.setAcceptDrops(not running)
+        for button in self.picker_buttons:
+            button.setEnabled(not running)
+        self.password_input.setEnabled(not running)
+        self.confirm_input.setEnabled(not running)
+        self.status_label.setText(
+            "Working on your files…" if running else "Ready when you are"
+        )
 
     def _run_batch(self, mode, paths=None):
-        target_paths = paths if paths is not None else self.selected_paths
+        if (
+            self.utility_tasks
+            or self._closing
+            or self.total_tasks > self.completed_tasks
+        ):
+            return
+        target_paths = list(paths if paths is not None else self.selected_paths)
+        if not target_paths:
+            return
+        try:
+            secret = self.password_input.text().encode("utf-8")
+            if not secret:
+                raise CryptoError("Enter a password first.")
+            keyfile_signature = None
+            if self.keyfile_path:
+                validate_source(Path(self.keyfile_path))
+                key_stat = Path(self.keyfile_path).stat()
+                if key_stat.st_size == 0:
+                    raise CryptoError("The selected keyfile is empty.")
+                keyfile_signature = source_signature(key_stat)
+            resolved = [Path(p).resolve() for p in target_paths]
+            input_paths = set(resolved)
+            if len(input_paths) != len(resolved):
+                raise CryptoError("Remove duplicate input paths before starting.")
+            for i, source in enumerate(resolved):
+                validate_source(Path(target_paths[i]))
+                if any(parent in input_paths for parent in source.parents):
+                    raise CryptoError(
+                        "Remove duplicate or overlapping input paths before starting."
+                    )
+                if self.shred_original.isChecked() and self.keyfile_path:
+                    keyfile = Path(self.keyfile_path).resolve()
+                    if source == keyfile or source in keyfile.parents:
+                        raise CryptoError(
+                            "Original deletion would destroy the selected keyfile."
+                        )
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot start batch", str(exc))
+            return
         self.cancel_event.clear()
         self.overall_bar.setValue(0)
         self.btn_open_output.setEnabled(False)
         self.total_tasks = len(target_paths)
         self.completed_tasks = 0
         self.batch_start_time = time.time()
+        self._batch_failed = self._batch_cancelled = 0
+        self.last_output_dir = None
+        self._task_progress = {path: 0 for path in target_paths}
+        self._progress_total = 0
         preset = self._preset_name()
-        secret = self._build_secret()
         cipher_ids = ENCRYPTION_TYPES[self.encryption_combo.currentIndex()]["ciphers"]
         enc_name = ENCRYPTION_TYPES[self.encryption_combo.currentIndex()]["name"]
         keyfile_note = " + keyfile" if self.keyfile_path else ""
@@ -1821,89 +1824,124 @@ class MainWindow(QWidget):
                 row_widget.status_label.setText("Starting...")
 
         if mode == "encrypt":
-            self.log(f"Starting encrypt on {self.total_tasks} item(s) "
-                     f"[{enc_name}, {preset} password preset{keyfile_note}, "
-                     f"{self.pool.maxThreadCount()} parallel workers]...")
+            self.log(
+                f"Starting encrypt on {self.total_tasks} item(s) "
+                f"[{enc_name}, {preset} password preset{keyfile_note}, "
+                f"{self.pool.maxThreadCount()} parallel workers]..."
+            )
         else:
-            self.log(f"Starting decrypt on {self.total_tasks} item(s) "
-                     f"[encryption type auto-detected per file{keyfile_note}, "
-                     f"{self.pool.maxThreadCount()} parallel workers]...")
+            self.log(
+                f"Starting decrypt on {self.total_tasks} item(s) "
+                f"[encryption type auto-detected per file{keyfile_note}, "
+                f"{self.pool.maxThreadCount()} parallel workers]..."
+            )
         self._set_running_state(True)
         self.tabs.setCurrentIndex(0)
 
         for path in target_paths:
-            task = CryptoTask(mode, path, secret, cipher_ids, preset,
-                               self.shred_original.isChecked(), self.output_dir, self.cancel_event,
-                               compress_folders=self.compress_folders.isChecked())
-            task.signals.progress.connect(self.on_item_progress)
-            task.signals.done.connect(self.on_item_done)
-            task.signals.failed.connect(self.on_item_failed)
-            task.signals.cancelled.connect(self.on_item_cancelled)
+            task = CryptoTask(
+                mode,
+                path,
+                secret,
+                cipher_ids,
+                preset,
+                self.shred_original.isChecked(),
+                self.output_dir,
+                self.cancel_event,
+                compress_folders=self.compress_folders.isChecked(),
+            )
+            task.keyfile_path = self.keyfile_path
+            task.keyfile_signature = keyfile_signature
+            self.active_tasks[path] = task
+            task.signals.progress.connect(self.on_item_progress, Qt.QueuedConnection)
+            task.signals.done.connect(self.on_item_done, Qt.QueuedConnection)
+            task.signals.failed.connect(self.on_item_failed, Qt.QueuedConnection)
+            task.signals.cancelled.connect(self.on_item_cancelled, Qt.QueuedConnection)
             self.pool.start(task)
 
     def cancel_batch(self):
         self.cancel_event.set()
+        for task in self.utility_tasks.values():
+            task.cancel_event.set()
         self.log("Cancel requested - in-progress items will stop shortly...")
+        self.status_label.setText("Stopping safely…")
 
+    def _update_progress(self, path, percent):
+        previous = self._task_progress.get(path, 0)
+        self._task_progress[path] = percent
+        self._progress_total += percent - previous
+        self.overall_bar.setValue(int(self._progress_total / max(self.total_tasks, 1)))
+
+    @Slot(str, int)
     def on_item_progress(self, path, percent):
+        self._update_progress(path, percent)
+
         row_widget = self.row_widgets.get(path)
         if row_widget:
             row_widget.set_progress(percent)
 
-    def _item_finished(self, output_dir=None):
+    def _item_finished(self, path, output_dir=None):
+        self.active_tasks.pop(path, None)
+        self._update_progress(path, 100)
         self.completed_tasks += 1
         if output_dir:
             self.last_output_dir = output_dir
-        self.overall_bar.setValue(int(self.completed_tasks / max(self.total_tasks, 1) * 100))
         if self.completed_tasks >= self.total_tasks:
             total_time = time.time() - (self.batch_start_time or time.time())
-            self.log(f"Batch finished in {total_time:.1f}s.")
+            succeeded = (
+                self.completed_tasks - self._batch_failed - self._batch_cancelled
+            )
+            summary = (
+                f"{succeeded} completed · {self._batch_failed} failed · "
+                f"{self._batch_cancelled} cancelled"
+            )
+            self.log(f"Batch finished in {total_time:.1f}s. {summary}")
             self._set_running_state(False)
+            self.status_label.setText(summary)
             if self.last_output_dir:
                 self.btn_open_output.setEnabled(True)
             if self.play_sound.isChecked():
                 QApplication.beep()
 
+    @Slot(str, str, float, object)
     def on_item_done(self, path, output_path, seconds, size):
         row_widget = self.row_widgets.get(path)
         if row_widget:
             row_widget.set_status("✓ Done", done=True)
         speed = human_size(size / max(seconds, 0.01)) + "/s"
-        self.log(f"[OK] {path} -> {output_path} ({human_size(size)}, {seconds:.1f}s, {speed})")
+        self.log(
+            f"[OK] {path} -> {output_path} ({human_size(size)}, {seconds:.1f}s, {speed})"
+        )
         out_path = Path(output_path)
         out_dir = out_path if out_path.is_dir() else out_path.parent
-        self._item_finished(output_dir=out_dir)
+        self._item_finished(path, output_dir=out_dir)
 
+    @Slot(str, str)
     def on_item_failed(self, path, error_msg):
+        self._batch_failed += 1
         row_widget = self.row_widgets.get(path)
         if row_widget:
             row_widget.set_status("✗ Failed", failed=True)
         self.log(f"[FAIL] {path}: {error_msg}")
-        self._item_finished()
+        self._item_finished(path)
 
+    @Slot(str)
     def on_item_cancelled(self, path):
+        self._batch_cancelled += 1
         row_widget = self.row_widgets.get(path)
         if row_widget:
             row_widget.set_status("⊘ Cancelled", cancelled=True)
         self.log(f"[CANCELLED] {path}")
-        self._item_finished()
+        self._item_finished(path)
 
 
 def _make_windows_dpi_aware():
-    """A `python main.py` run automatically gets a DPI-aware manifest from
-    the official Python installer, so Qt always scales correctly. A
-    PyInstaller .exe does NOT inherit that manifest by default - so on a
-    display with different scaling than the build machine, Windows
-    silently bitmap-stretches the whole window instead of letting Qt
-    render it natively. That produces exactly the symptom of "looks fine
-    via python, fine on the build PC, but blurry/wrong-sized/misaligned
-    on a different PC" - not a styling bug, a scaling one. This declares
-    the process DPI-aware at the OS level before Qt ever starts, so the
-    packaged exe behaves identically to the source version everywhere."""
+    """Request DPI awareness before constructing Qt widgets on Windows."""
     if sys.platform != "win32":
         return
     try:
         import ctypes
+
         # PROCESS_PER_MONITOR_DPI_AWARE - correct, modern scaling behavior
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
@@ -1914,6 +1952,17 @@ def _make_windows_dpi_aware():
             pass
 
 
+def configure_font(app):
+    if not QFontDatabase.families() and sys.platform == "win32":
+        font = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "segoeui.ttf"
+        if font.is_file():
+            QFontDatabase.addApplicationFont(str(font))
+    family = QFontDatabase.systemFont(QFontDatabase.GeneralFont).family()
+    if "Segoe UI" in QFontDatabase.families():
+        family = "Segoe UI"
+    app.setFont(QFont(family, 10))
+
+
 def main():
     _make_windows_dpi_aware()
 
@@ -1922,7 +1971,9 @@ def main():
     # the default rounding policy can produce slightly-wrong-sized,
     # blurry-looking UI. PassThrough uses the exact scale factor Windows
     # reports instead of rounding it, which renders crisply everywhere.
-    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
 
     app = QApplication(sys.argv)
     # Force Qt's built-in "Fusion" style instead of the native Windows
@@ -1930,11 +1981,7 @@ def main():
     # a separate plugin DLL that a packaged exe can fail to bundle or
     # load correctly on a different machine.
     app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI", 10))
+    configure_font(app)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+    return app.exec()
