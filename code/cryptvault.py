@@ -84,37 +84,13 @@ def dependency_check():
     return 0
 
 
-def install_dependencies(*, build=False):
-    packages = ["-r", str(PROJECT_DIR / "requirements.txt")]
-    if build:
-        packages.append("pyinstaller>=6.22.3")
+def install_dependencies():
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", *packages],
+        [sys.executable, "-m", "pip", "install", "--upgrade",
+         "-r", str(PROJECT_DIR / "requirements.txt")],
         cwd=PROJECT_DIR,
         check=True,
     )
-
-
-def build_executable():
-    install_dependencies(build=True)
-    command = [
-        sys.executable,
-        "-m",
-        "PyInstaller",
-        "--noconfirm",
-        "--onefile",
-        "--windowed",
-        "--clean",
-        "--noupx",
-        "--name",
-        "CryptVault",
-    ]
-    for package in ("PySide6", "shiboken6", "cryptography"):
-        command.extend(["--collect-all", package])
-    command.append(str(PROJECT_DIR / "cryptvault.py"))
-    subprocess.run(command, cwd=PROJECT_DIR, check=True)
-    print(f"Build saved to {PROJECT_DIR / 'dist'}")
-    return 0
 
 
 def run(argv=None):
@@ -137,7 +113,9 @@ def run(argv=None):
         if command == "check":
             return dependency_check()
         if command == "build":
-            return build_executable()
+            from compul import build
+
+            return build()
         import app
 
         return app.main()

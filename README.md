@@ -252,14 +252,14 @@ python -m pip install --upgrade -r requirements.txt
 | `python cryptvault.py` | Open the app |
 | `python cryptvault.py install` | Install/update the runtime libraries |
 | `python cryptvault.py check` | Check the Python installation and libraries |
-| `python cryptvault.py build` | Install build tools and create a standalone app |
+| `python compul.py` | Detect the OS, install build tools, and compile the app |
 
 Use the **same Python command** for installing and running. Libraries
 installed for one Python version aren't automatically available to another.
 
 The runtime dependencies are **`PySide6-Essentials`** for the GUI and
 **`cryptography`** for encryption. PyInstaller is installed only when you
-run `build`; it isn't needed to run the source.
+run `compul.py`; it isn't needed to run the source.
 
 If Linux/macOS pip reports an **externally managed environment**, use a
 user-managed Python installation. The launcher respects the OS's package
@@ -287,18 +287,30 @@ py -3.14 cryptvault.py
 
 From the `code` folder, run:
 ```bash
-python cryptvault.py build
+python compul.py
 ```
-Use `python3` on Linux/macOS.
+Use `python3 compul.py` on Linux/macOS. This separate Python script detects
+the operating system and CPU architecture, checks pip, installs the
+runtime libraries and PyInstaller, and compiles the app automatically.
+No venv, batch file, or extra setup script is needed.
 
-The launcher installs the runtime libraries and PyInstaller, then bundles
-the app with `--onefile --windowed --clean --noupx` and the required
-Qt/cryptography package data. No venv is created, and no manual cleanup
-of your previous build folders is needed.
+- **Windows:** `code/dist/CryptVault.exe`, a single executable.
+- **Linux:** `code/dist/CryptVault`, a single executable.
+- **macOS:** `code/dist/CryptVault.app`, an app bundle. Distribute the
+  whole bundle.
 
-- **Windows:** `dist/CryptVault.exe`.
-- **Linux:** `dist/CryptVault`.
-- **macOS:** `dist/CryptVault` and/or a `.app` bundle, depending on the build.
+macOS uses a folder-based bundle to avoid unpacking a one-file executable
+at every launch. This follows the
+[PyInstaller macOS guidance](https://pyinstaller.org/en/stable/usage.html#building-macos-app-bundles).
+The script keeps intermediate files under `code/build/` and finished
+builds under `code/dist/`, without deleting unrelated files.
+
+You can preview the detected OS and destination without downloading or
+compiling anything:
+```bash
+python compul.py --check
+```
+The existing `python cryptvault.py build` command calls the same compiler.
 
 The machine running the finished app doesn't need Python installed.
 Build separately for each OS and CPU architecture, and test the result
@@ -323,7 +335,8 @@ File-encrypter/
 ├── README.md
 ├── LICENSE.md
 └── code/
-    ├── cryptvault.py    # run, install, check, build, and startup diagnostics
+    ├── cryptvault.py    # run, install, check, and startup diagnostics
+    ├── compul.py        # automatic compiler for Windows, macOS, and Linux
     ├── app.py           # GUI and background tasks
     ├── crypto_engine.py # encryption and safe file operations
     └── requirements.txt
